@@ -213,29 +213,11 @@ func action(cliCtx *cli.Context) error {
 	_ = l2RollupFile.Close()
 	signer := types.LatestSignerForChainID(rollupConfig.L2ChainID)
 
-	eng := NewAnvilEngine(c2, signer)
+	eng := newAnvilEngine(c2, signer)
 
 	go func() {
 		u, _ := url.Parse(fmt.Sprintf("http://localhost:%d", l2AnvilPort))
-		proxy := &httputil.ReverseProxy{}
-		proxy.Rewrite = func(r *httputil.ProxyRequest) {
-			body, err := io.ReadAll(r.Out.Body)
-			if err != nil {
-				return
-			}
-			body = eng.ModifyRequest(body)
-			r.Out.Body = io.NopCloser(bytes.NewBuffer(body))
-			r.Out.URL = u
-		}
-		proxy.ModifyResponse = func(r *http.Response) error {
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				return err
-			}
-			body = eng.ModifyResponse(body)
-			r.Body = io.NopCloser(bytes.NewBuffer(body))
-			return nil
-		}
+		proxy := httputil.NewSingleHostReverseProxy(u)
 		err = http.ListenAndServe(fmt.Sprintf(":%d", l2Port), http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 			body, err := io.ReadAll(r.Body)
 			r.Body = io.NopCloser(bytes.NewBuffer(body))
@@ -337,8 +319,6 @@ func action(cliCtx *cli.Context) error {
 				_, _ = rw.Write(resBytes)
 				return
 			}
-			// TODO: record the response from the following proxy call
-			// and replace any deposit txs / hashes with the ones from the deposit txs in the payload
 			proxy.ServeHTTP(rw, r)
 
 		}))
@@ -447,17 +427,13 @@ type anvilEngine struct {
 	client   *ethclient.Client
 	signer   types.Signer
 	payloads map[engine.PayloadID]engine.ExecutableData
-	txs      map[common.Hash]types.Transaction
-	deposits map[common.Hash]common.Hash
 }
 
-func NewAnvilEngine(client *ethclient.Client, signer types.Signer) *anvilEngine {
+func newAnvilEngine(client *ethclient.Client, signer types.Signer) *anvilEngine {
 	return &anvilEngine{
 		client:   client,
 		signer:   signer,
 		payloads: make(map[engine.PayloadID]engine.ExecutableData),
-		txs:      make(map[common.Hash]types.Transaction),
-		deposits: make(map[common.Hash]common.Hash),
 	}
 }
 
@@ -497,36 +473,28 @@ func (e *anvilEngine) ForkchoiceUpdatedV1(update engine.ForkchoiceStateV1, paylo
 			if err != nil {
 				return result, err
 			}
-			if tx.Mint() != nil && tx.Mint().Cmp(big.NewInt(0)) != 0 {
-				balance, err := e.client.PendingBalanceAt(ctx, sender)
-				if err != nil {
-					return result, err
-				}
-				newBalance := hexutil.EncodeBig(balance.Add(balance, tx.Mint()))
-				err = e.client.Client().CallContext(ctx, &r, "anvil_setBalance", sender.String(), newBalance)
-				if err != nil {
-					return result, err
-				}
-			}
 			err = e.client.Client().CallContext(ctx, &r, "anvil_impersonateAccount", sender.String())
 			if err != nil {
 				return result, err
 			}
 			var hash common.Hash
 			tx2 := make(map[string]string)
+			tx2["type"] = "0x7E"
 			tx2["from"] = sender.String()
 			tx2["to"] = tx.To().String()
 			tx2["gas"] = hexutil.EncodeUint64(tx.Gas())
-			tx2["gasPrice"] = hexutil.EncodeBig(tx.GasPrice())
 			tx2["value"] = hexutil.EncodeBig(tx.Value())
 			tx2["data"] = hexutil.Encode(tx.Data())
+			tx2["mint"] = hexutil.EncodeBig(tx.Mint())
+			tx2["sourceHash"] = tx.SourceHash().String()
+			log.Info("Sending deposit transaction", "tx", tx2)
 			err = e.client.Client().CallContext(ctx, &hash, "eth_sendTransaction", tx2)
 			if err != nil {
 				return result, err
 			}
 			log.Info("Sent deposit transaction", "hash", hash)
-			e.txs[hash] = *tx
-			e.deposits[tx.Hash()] = hash
+		} else {
+			// TODO will op-node send anything other than deposit txs here?
 		}
 	}
 
@@ -583,48 +551,6 @@ func (e *anvilEngine) NewPayloadV1(params engine.ExecutableData) (engine.Payload
 		Status:          engine.VALID,
 		LatestValidHash: &params.BlockHash,
 	}, nil
-}
-
-func (e *anvilEngine) ModifyRequest(r []byte) []byte {
-	fmt.Printf("Request: %s\n", string(r))
-	return r
-}
-
-func (e *anvilEngine) ModifyResponse(r []byte) []byte {
-	fmt.Printf("Response before: %s\n", string(r))
-	var res interface{}
-	_ = json.Unmarshal(r, &res)
-	res = e.replaceTxs(res)
-	r, _ = json.Marshal(res)
-	fmt.Printf("Response after: %s\n", string(r))
-	return r
-}
-
-func (e *anvilEngine) replaceTxs(j interface{}) interface{} {
-	switch j.(type) {
-	case []interface{}:
-		a := j.([]interface{})
-		for i, v := range a {
-			a[i] = e.replaceTxs(v)
-		}
-	case map[string]interface{}:
-		m := j.(map[string]interface{})
-		if m["hash"] != nil {
-			if hash, ok := m["hash"].(string); ok {
-				h := common.HexToHash(hash)
-				if deposit, ok := e.txs[h]; ok {
-					js, _ := deposit.MarshalJSON()
-					var n interface{}
-					_ = json.Unmarshal(js, &n)
-					return n
-				}
-			}
-		}
-		for k, v := range m {
-			m[k] = e.replaceTxs(v)
-		}
-	}
-	return j
 }
 
 // steps:
