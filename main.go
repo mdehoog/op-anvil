@@ -143,7 +143,7 @@ func action(cliCtx *cli.Context) error {
 	}
 	_ = l1GenesisFile.Close()
 
-	a1, c1, err := anvil(ctx, l1Port, l1GenesisFile.Name(), color.YellowString("L1: "), 12)
+	a1, c1, err := anvil(ctx, l1Port, l1GenesisFile.Name(), color.YellowString("L1: "), 12, false)
 	if err != nil {
 		log.Crit("Failed to start L1 anvil", "message", err)
 	}
@@ -179,7 +179,7 @@ func action(cliCtx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	a2, c2, err := anvil(ctx, l2AnvilPort, l2GenesisFile.Name(), color.CyanString("L2: "), 0)
+	a2, c2, err := anvil(ctx, l2AnvilPort, l2GenesisFile.Name(), color.CyanString("L2: "), 0, true)
 	if err != nil {
 		log.Crit("Failed to start L2 anvil", "message", err)
 	}
@@ -364,12 +364,15 @@ func action(cliCtx *cli.Context) error {
 	return app.Run(nodeArgs)
 }
 
-func anvil(ctx context.Context, port int, genesis, linePrefix string, blockTime int) (*exec.Cmd, *ethclient.Client, error) {
+func anvil(ctx context.Context, port int, genesis, linePrefix string, blockTime int, optimism bool) (*exec.Cmd, *ethclient.Client, error) {
 	args := []string{"--port", strconv.Itoa(port), "--init", genesis}
 	if blockTime > 0 {
 		args = append(args, "--block-time", strconv.Itoa(blockTime))
 	} else {
 		args = append(args, "--no-mining")
+	}
+	if optimism {
+		args = append(args, "--optimism")
 	}
 	log.Info("Running anvil", "args", args)
 	cmd := exec.Command("anvil", args...)
@@ -462,11 +465,6 @@ func (e *anvilEngine) ForkchoiceUpdatedV1(update engine.ForkchoiceStateV1, paylo
 	}
 
 	var r interface{}
-	err := e.client.Client().CallContext(ctx, &r, "anvil_setNextBlockBaseFeePerGas", "0x0")
-	if err != nil {
-		return result, err
-	}
-
 	for _, tx := range transactions {
 		if tx.IsDepositTx() {
 			sender, err := e.signer.Sender(tx)
@@ -478,7 +476,7 @@ func (e *anvilEngine) ForkchoiceUpdatedV1(update engine.ForkchoiceStateV1, paylo
 				return result, err
 			}
 			var hash common.Hash
-			tx2 := make(map[string]string)
+			tx2 := make(map[string]interface{})
 			tx2["type"] = "0x7E"
 			tx2["from"] = sender.String()
 			tx2["to"] = tx.To().String()
@@ -487,6 +485,7 @@ func (e *anvilEngine) ForkchoiceUpdatedV1(update engine.ForkchoiceStateV1, paylo
 			tx2["data"] = hexutil.Encode(tx.Data())
 			tx2["mint"] = hexutil.EncodeBig(tx.Mint())
 			tx2["sourceHash"] = tx.SourceHash().String()
+			tx2["isSystemTx"] = tx.IsSystemTx()
 			log.Info("Sending deposit transaction", "tx", tx2)
 			err = e.client.Client().CallContext(ctx, &hash, "eth_sendTransaction", tx2)
 			if err != nil {
@@ -499,7 +498,7 @@ func (e *anvilEngine) ForkchoiceUpdatedV1(update engine.ForkchoiceStateV1, paylo
 	}
 
 	// parameters: number of blocks, time between blocks
-	err = e.client.Client().CallContext(ctx, &r, "anvil_mine", "0x1", "0x2")
+	err := e.client.Client().CallContext(ctx, &r, "anvil_mine", "0x1", "0x2")
 	if err != nil {
 		return result, err
 	}
@@ -509,13 +508,13 @@ func (e *anvilEngine) ForkchoiceUpdatedV1(update engine.ForkchoiceStateV1, paylo
 		return result, err
 	}
 
-	//transactionsBinary := make([][]byte, block.Transactions().Len())
-	//for i, tx := range block.Transactions() {
-	//	transactionsBinary[i], err = tx.MarshalBinary()
-	//	if err != nil {
-	//		return result, err
-	//	}
-	//}
+	transactionsBinary := make([][]byte, block.Transactions().Len())
+	for i, tx := range block.Transactions() {
+		transactionsBinary[i], err = tx.MarshalBinary()
+		if err != nil {
+			return result, err
+		}
+	}
 
 	data := engine.ExecutableData{
 		ParentHash:    block.ParentHash(),
@@ -531,7 +530,7 @@ func (e *anvilEngine) ForkchoiceUpdatedV1(update engine.ForkchoiceStateV1, paylo
 		ExtraData:     block.Extra(),
 		BaseFeePerGas: block.BaseFee(),
 		BlockHash:     block.Hash(),
-		Transactions:  payloadAttributes.Transactions, // TODO add any extra txs in block.Transactions
+		Transactions:  transactionsBinary,
 		Withdrawals:   block.Withdrawals(),
 	}
 	e.payloads[payloadID] = data
